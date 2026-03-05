@@ -6,10 +6,21 @@ Implementation of aggregators from the paper.
 import torch
 import numpy as np
 from typing import List
+import io
+import contextlib
 try:
     import cvxpy as cp
 except ImportError:
     cp = None
+
+
+def _solve_problem_quietly(prob):
+    """Solve CVXPY problem while suppressing noisy solver stdout/stderr."""
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            prob.solve(solver=cp.OSQP, verbose=False, polish=False, warm_start=True)
+        except Exception:
+            prob.solve(verbose=False)
 
 
 class Aggregator:
@@ -92,7 +103,7 @@ class UPGradAggregator(Aggregator):
                 
                 # Solve QP
                 prob = cp.Problem(objective, constraints)
-                prob.solve()
+                _solve_problem_quietly(prob)
                 
                 if w.value is not None:
                     weights = torch.tensor(w.value, dtype=J.dtype, device=J.device)
@@ -152,7 +163,7 @@ class MGDAAggregator(Aggregator):
                 ]
                 
                 prob = cp.Problem(objective, constraints)
-                prob.solve()
+                _solve_problem_quietly(prob)
                 
                 if w.value is not None:
                     weights = torch.tensor(w.value, dtype=J.dtype, device=J.device)

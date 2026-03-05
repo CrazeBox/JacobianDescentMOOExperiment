@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import json
 import os
 import argparse
+import sys
 from tqdm import tqdm
 import yaml
 
@@ -207,7 +208,13 @@ class JacobianDescentTrainer:
         total_cosine = 0.0
         num_batches = 0
         
-        for batch_data, batch_labels, _ in tqdm(train_loader, desc="Training", leave=False):
+        show_batch_bar = sys.stdout.isatty()
+        for batch_data, batch_labels, _ in tqdm(
+            train_loader,
+            desc="Training",
+            leave=False,
+            disable=not show_batch_bar
+        ):
             batch_data = batch_data.to(self.device)
             batch_labels = batch_labels.to(self.device)
             
