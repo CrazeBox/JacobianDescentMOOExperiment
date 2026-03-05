@@ -58,7 +58,7 @@ class UPGradAggregator(Aggregator):
     """
     
     def __init__(self, epsilon: float = 1e-8):
-        self.epsilon = epsilon
+        self.epsilon = float(epsilon)
     
     def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
         if len(gradients) == 1:
@@ -130,7 +130,7 @@ class MGDAAggregator(Aggregator):
     """
     
     def __init__(self, epsilon: float = 1e-8):
-        self.epsilon = epsilon
+        self.epsilon = float(epsilon)
     
     def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
         if len(gradients) == 1:
@@ -186,32 +186,38 @@ class CAGradAggregator(Aggregator):
     """
     
     def __init__(self, c: float = 0.5, epsilon: float = 1e-8):
-        self.c = c
-        self.epsilon = epsilon
+        self.c = float(c)
+        self.epsilon = float(epsilon)
     
     def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
         if len(gradients) == 1:
             return gradients[0]
         
         J = torch.stack(gradients)
-        m = J.size(0)
+        if not torch.isfinite(J).all():
+            # Fallback early if upstream gradients already contain NaN/Inf.
+            return torch.nan_to_num(J.mean(dim=0), nan=0.0, posinf=0.0, neginf=0.0)
         
         # Compute average gradient
         avg_grad = J.mean(dim=0)
+        if not torch.isfinite(avg_grad).all():
+            return torch.nan_to_num(avg_grad, nan=0.0, posinf=0.0, neginf=0.0)
+        denom = torch.clamp(avg_grad.square().sum(), min=self.epsilon)
         
         # Adjust individual gradients
         adjusted_grads = []
         for grad in gradients:
             # Compute dot product
-            dot = torch.dot(grad, avg_grad)
+            dot = torch.sum(grad * avg_grad)
             
             # If conflicting (dot < 0), project away from conflict
-            if dot < -self.epsilon:
+            if dot.item() < -self.epsilon:
                 # Project grad onto avg_grad
-                proj = (dot / (torch.norm(avg_grad)**2 + self.epsilon)) * avg_grad
+                proj = (dot / denom) * avg_grad
                 adjusted = grad - (1 + self.c) * proj
             else:
                 adjusted = grad
+            adjusted = torch.nan_to_num(adjusted, nan=0.0, posinf=0.0, neginf=0.0)
             
             adjusted_grads.append(adjusted)
         
@@ -229,7 +235,7 @@ class PCGradAggregator(Aggregator):
     """
     
     def __init__(self, epsilon: float = 1e-8):
-        self.epsilon = epsilon
+        self.epsilon = float(epsilon)
     
     def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
         if len(gradients) == 1:
