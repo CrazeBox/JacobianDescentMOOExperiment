@@ -1,0 +1,50 @@
+# Configuration for Jacobian Descent CIFAR-10 Reproduction
+# Paper: "Jacobian Descent for Multi-Objective Optimization" (arXiv:2406.16232)
+
+experiment:
+  name: "JD_CIFAR10_Reproduction"
+  seed: 42
+  device: "cuda"  # or "cpu"
+  
+dataset:
+  name: "CIFAR10"
+  num_tasks: 5
+  classes_per_task: 2
+  data_root: "./data"
+  
+model:
+  architecture: "ResNet18"
+  pretrained: false
+  
+training:
+  num_epochs: 200
+  batch_size: 128
+  learning_rate: 0.1
+  momentum: 0.9
+  weight_decay: 0.0005
+  scheduler: "cosine"
+  
+aggregators:
+  - name: "Mean"
+    type: "mean"
+  - name: "UPGrad"
+    type: "upgrad"
+    epsilon: 1e-8
+  - name: "MGDA"
+    type: "mgda"
+  - name: "CAGrad"
+    type: "cagrad"
+    c: 0.5
+    
+evaluation:
+  metrics:
+    - "average_accuracy"
+    - "per_task_accuracy"
+    - "fairness"
+    - "convergence_speed"
+  eval_frequency: 10
+  
+logging:
+  log_dir: "./logs"
+  save_checkpoints: true
+  checkpoint_frequency: 50
