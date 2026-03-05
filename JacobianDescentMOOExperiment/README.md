@@ -70,10 +70,14 @@ Results are saved in the `results/` directory:
 
 ## Expected Results
 
-Based on the paper, UPGrad should achieve:
-- **Average accuracy**: ~85-90% across all tasks
-- **Fairness**: Low variance between task accuracies
-- **Convergence**: Faster than baseline methods
+For paper-style comparison, focus on:
+- **Training cross-entropy** over epochs
+- **Update similarity to SGD update** (cosine similarity) over epochs
+
+Auxiliary metrics kept in `results.json`:
+- average accuracy
+- per-task accuracy
+- fairness (std across tasks)
 
 ## File Structure
 

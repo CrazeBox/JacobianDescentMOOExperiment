@@ -6,6 +6,7 @@ Reproduces results from the paper.
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision
 import torchvision.transforms as transforms
@@ -177,6 +178,15 @@ class JacobianDescentTrainer:
         
         # Aggregate gradients
         aggregated_gradient = self.aggregator(task_gradients)
+        sgd_gradient = torch.stack(task_gradients).mean(dim=0)
+
+        # Similarity to SGD update direction from the same batch.
+        cosine_sim = F.cosine_similarity(
+            aggregated_gradient.unsqueeze(0),
+            sgd_gradient.unsqueeze(0),
+            dim=1,
+            eps=1e-12
+        ).item()
         
         # Apply aggregated gradient
         self.optimizer.zero_grad()
@@ -188,25 +198,29 @@ class JacobianDescentTrainer:
         
         self.optimizer.step()
         
-        return [loss.item() for loss in losses]
+        return [loss.item() for loss in losses], cosine_sim
     
     def train_epoch(self, train_loader):
         """Train for one epoch."""
         self.model.train()
         total_loss = [0.0] * self.num_tasks
+        total_cosine = 0.0
         num_batches = 0
         
         for batch_data, batch_labels, _ in tqdm(train_loader, desc="Training", leave=False):
             batch_data = batch_data.to(self.device)
             batch_labels = batch_labels.to(self.device)
             
-            losses = self.train_step(batch_data, batch_labels)
+            losses, cosine_sim = self.train_step(batch_data, batch_labels)
             
             for i, loss in enumerate(losses):
                 total_loss[i] += loss
+            total_cosine += cosine_sim
             num_batches += 1
         
-        return [loss / num_batches for loss in total_loss]
+        avg_losses = [loss / num_batches for loss in total_loss]
+        avg_cosine = total_cosine / num_batches
+        return avg_losses, avg_cosine
     
     def evaluate(self, test_loader):
         """Evaluate on test set."""
@@ -312,26 +326,29 @@ def run_experiment(config):
         
         # Training history
         history = {
-            'train_loss': [],
+            'train_cross_entropy': [],
+            'update_similarity_to_sgd': [],
             'test_acc': [],
             'per_task_acc': []
         }
         
         # Training loop
         for epoch in range(num_epochs):
-            train_losses = trainer.train_epoch(train_loader)
+            train_losses, avg_similarity = trainer.train_epoch(train_loader)
             avg_train_loss = sum(train_losses) / len(train_losses)
             
             test_accs = trainer.evaluate(test_loader)
             avg_test_acc = sum(test_accs) / len(test_accs)
             
-            history['train_loss'].append(avg_train_loss)
+            history['train_cross_entropy'].append(avg_train_loss)
+            history['update_similarity_to_sgd'].append(avg_similarity)
             history['test_acc'].append(avg_test_acc)
             history['per_task_acc'].append(test_accs)
             
             if (epoch + 1) % max(1, int(config.get('eval_frequency', 10))) == 0 or epoch == 0:
                 print(f"Epoch {epoch+1}/{num_epochs}: "
-                      f"Loss={avg_train_loss:.4f}, "
+                      f"CE={avg_train_loss:.4f}, "
+                      f"Sim(SGD)={avg_similarity:.4f}, "
                       f"Avg Acc={avg_test_acc:.2f}%, "
                       f"Tasks={[f'{acc:.1f}' for acc in test_accs]}")
             
@@ -358,21 +375,21 @@ def plot_results(results, save_path='results.png'):
     """Plot and save results."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # Training loss
+    # Training cross-entropy
     for agg_name, history in results.items():
-        axes[0].plot(history['train_loss'], label=agg_name, linewidth=2)
+        axes[0].plot(history['train_cross_entropy'], label=agg_name, linewidth=2)
     axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Training Loss', fontsize=12)
-    axes[0].set_title('Training Loss over Epochs', fontsize=14)
+    axes[0].set_ylabel('Training Cross-Entropy', fontsize=12)
+    axes[0].set_title('Training Cross-Entropy over Epochs', fontsize=14)
     axes[0].legend(fontsize=10)
     axes[0].grid(True, alpha=0.3)
     
-    # Test accuracy
+    # Update similarity to SGD
     for agg_name, history in results.items():
-        axes[1].plot(history['test_acc'], label=agg_name, linewidth=2)
+        axes[1].plot(history['update_similarity_to_sgd'], label=agg_name, linewidth=2)
     axes[1].set_xlabel('Epoch', fontsize=12)
-    axes[1].set_ylabel('Test Accuracy (%)', fontsize=12)
-    axes[1].set_title('Test Accuracy over Epochs', fontsize=14)
+    axes[1].set_ylabel('Cosine Similarity', fontsize=12)
+    axes[1].set_title('Update Similarity to SGD over Epochs', fontsize=14)
     axes[1].legend(fontsize=10)
     axes[1].grid(True, alpha=0.3)
     
@@ -387,7 +404,11 @@ def plot_results(results, save_path='results.png'):
     for agg_name, history in results.items():
         final_acc = history['test_acc'][-1]
         final_task_accs = history['per_task_acc'][-1]
+        final_ce = history['train_cross_entropy'][-1]
+        final_sim = history['update_similarity_to_sgd'][-1]
         print(f"\n{agg_name}:")
+        print(f"  Final Training Cross-Entropy: {final_ce:.4f}")
+        print(f"  Final Update Similarity to SGD: {final_sim:.4f}")
         print(f"  Average Accuracy: {final_acc:.2f}%")
         print(f"  Per-task Accuracies: {[f'{acc:.2f}%' for acc in final_task_accs]}")
         print(f"  Min Task Accuracy: {min(final_task_accs):.2f}%")

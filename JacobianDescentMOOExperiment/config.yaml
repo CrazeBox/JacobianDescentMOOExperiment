@@ -38,10 +38,11 @@ aggregators:
     
 evaluation:
   metrics:
-    - "average_accuracy"
-    - "per_task_accuracy"
-    - "fairness"
-    - "convergence_speed"
+    - "training_cross_entropy"
+    - "update_similarity_to_sgd"
+    - "average_accuracy"      # auxiliary
+    - "per_task_accuracy"     # auxiliary
+    - "fairness"              # auxiliary
   eval_frequency: 10
   
 logging:
