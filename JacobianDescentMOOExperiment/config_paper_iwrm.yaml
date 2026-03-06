@@ -1,0 +1,58 @@
+# Paper-aligned IWRM + SSJD configuration for CIFAR-10
+# Jacobian Descent for Multi-Objective Optimization (arXiv:2406.16232)
+
+experiment:
+  seed: 0
+  run_seeds: [0, 1, 2, 3, 4, 5, 6, 7]
+  device: "cuda"
+
+dataset:
+  data_root: "./data"
+  train_subset_size: 1024
+  augment: false
+
+training:
+  num_epochs: 20
+  batch_size: 32
+  learning_rate: 0.1
+  momentum: 0.0
+  weight_decay: 0.0
+  num_workers: 2
+
+learning_rate_search:
+  enabled: true
+  coarse_min_exp: -5
+  coarse_max_exp: 2
+  coarse_num: 22
+  refined_num: 50
+  refine_margin_exp: 0.3333333333
+  trial_epochs: 20
+
+aggregators:
+  - name: "Mean"
+    type: "mean"
+  - name: "UPGrad"
+    type: "upgrad"
+    epsilon: 1.0e-8
+  - name: "MGDA"
+    type: "mgda"
+  - name: "CAGrad"
+    type: "cagrad"
+    c: 0.5
+  - name: "PCGrad"
+    type: "pcgrad"
+  - name: "DualProj"
+    type: "dualproj"
+  - name: "AlignedMTL"
+    type: "alignedmtl"
+  - name: "GradDrop"
+    type: "graddrop"
+  - name: "IMTLG"
+    type: "imtlg"
+  - name: "NashMTL"
+    type: "nashmtl"
+  - name: "RGW"
+    type: "rgw"
+
+logging:
+  log_dir: "./logs_paper_iwrm"

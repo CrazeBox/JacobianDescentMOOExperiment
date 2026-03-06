@@ -13,6 +13,11 @@ try:
 except ImportError:
     cp = None
 
+try:
+    import torchjd.aggregation as tjagg
+except ImportError:
+    tjagg = None
+
 
 def _solve_problem_quietly(prob):
     """Solve CVXPY problem while suppressing noisy solver stdout/stderr."""
@@ -265,6 +270,25 @@ class PCGradAggregator(Aggregator):
         return aggregated
 
 
+class TorchJDAggregator(Aggregator):
+    """Thin wrapper around torchjd aggregators when torchjd is available."""
+
+    def __init__(self, class_name: str, **kwargs):
+        if tjagg is None:
+            raise ImportError(
+                f"Aggregator '{class_name}' requires torchjd. "
+                f"Install it via `pip install torchjd`."
+            )
+        cls = getattr(tjagg, class_name, None)
+        if cls is None:
+            raise ValueError(f"torchjd.aggregation has no class '{class_name}'.")
+        self.inner = cls(**kwargs)
+
+    def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
+        J = torch.stack(gradients)
+        return self.inner(J)
+
+
 def get_aggregator(name: str, **kwargs) -> Aggregator:
     """
     Factory function to get aggregator by name.
@@ -276,15 +300,39 @@ def get_aggregator(name: str, **kwargs) -> Aggregator:
     Returns:
         Aggregator instance
     """
+    normalized = name.lower().replace("-", "").replace("_", "")
     aggregators = {
         "mean": MeanAggregator,
         "upgrad": UPGradAggregator,
         "mgda": MGDAAggregator,
         "cagrad": CAGradAggregator,
-        "pcgrad": PCGradAggregator
+        "pcgrad": PCGradAggregator,
+        "dualproj": lambda **kw: TorchJDAggregator("DualProj", **kw),
+        "alignedmtl": lambda **kw: TorchJDAggregator("AlignedMTL", **kw),
+        "graddrop": lambda **kw: TorchJDAggregator("GradDrop", **kw),
+        "imtlg": lambda **kw: TorchJDAggregator("IMTLG", **kw),
+        "nashmtl": lambda **kw: TorchJDAggregator("NashMTL", **kw),
+        "rgw": lambda **kw: TorchJDAggregator("Random", **kw),
     }
-    
-    if name.lower() not in aggregators:
-        raise ValueError(f"Unknown aggregator: {name}. Available: {list(aggregators.keys())}")
-    
-    return aggregators[name.lower()](**kwargs)
+    alias = {
+        "amean": "mean",
+        "aupgrad": "upgrad",
+        "amgda": "mgda",
+        "acagrad": "cagrad",
+        "apcgrad": "pcgrad",
+        "adualproj": "dualproj",
+        "aalignedmtl": "alignedmtl",
+        "agraddrop": "graddrop",
+        "aimtlg": "imtlg",
+        "anashmtl": "nashmtl",
+        "argw": "rgw",
+    }
+    key = alias.get(normalized, normalized)
+
+    if key not in aggregators:
+        raise ValueError(
+            f"Unknown aggregator: {name}. Available: {list(aggregators.keys())} "
+            f"(accepted aliases: {list(alias.keys())})"
+        )
+
+    return aggregators[key](**kwargs)

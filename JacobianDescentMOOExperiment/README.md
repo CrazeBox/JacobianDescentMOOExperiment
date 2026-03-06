@@ -57,6 +57,23 @@ python run_experiment.py --config config.yaml
 
 The script now aggregates metrics across multiple seeds and reports mean/std.
 
+### Run paper-aligned IWRM reproduction (recommended)
+```bash
+pip install torchjd
+python reproduce_paper_iwrm.py --config config_paper_iwrm.yaml --device cuda
+```
+
+This pipeline implements:
+- IWRM + SSJD style optimization with per-sample objectives (sub-Jacobian rows from batch samples)
+- CIFAR-10 subset size 1024 per run
+- 8-run seed repetition by default
+- Two-stage learning-rate selection per method and seed (coarse 22 + refined 50)
+- Reporting mean/SEM curves for:
+  - training cross-entropy
+  - update cosine similarity to SGD
+
+`config_paper_iwrm.yaml` includes additional methods (`DualProj`, `AlignedMTL`, `GradDrop`, `IMTLG`, `NashMTL`) that are loaded through `torchjd`.
+
 ### Run with specific device
 ```bash
 python run_experiment.py --device cuda
