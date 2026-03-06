@@ -197,6 +197,9 @@ def train_one_run(
 
             logits = model(x)
             per_sample_losses = criterion(logits, y)  # [batch]
+            if not torch.isfinite(per_sample_losses).all():
+                # Skip unstable batch to avoid propagating NaN/Inf into Jacobian rows.
+                continue
 
             jac_rows = []
             for i in range(per_sample_losses.shape[0]):
@@ -205,7 +208,11 @@ def train_one_run(
                 jac_rows.append(flatten_grads(params))
 
             J = torch.stack(jac_rows, dim=0)  # [m, n]
+            if not torch.isfinite(J).all():
+                J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
             agg = aggregator([row for row in J])
+            if not torch.isfinite(agg).all():
+                agg = torch.nan_to_num(agg, nan=0.0, posinf=0.0, neginf=0.0)
             mean_grad = J.mean(dim=0)
             sim = torch.nn.functional.cosine_similarity(
                 agg.unsqueeze(0), mean_grad.unsqueeze(0), dim=1, eps=1e-12

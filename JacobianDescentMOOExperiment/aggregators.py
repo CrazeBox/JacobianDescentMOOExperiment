@@ -269,9 +269,11 @@ class PCGradAggregator(Aggregator):
     def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
         if len(gradients) == 1:
             return gradients[0]
-        
-        # Start with a copy of gradients
-        adjusted_grads = [g.clone() for g in gradients]
+
+        # Start with a copy of gradients and sanitize non-finite values.
+        adjusted_grads = [
+            torch.nan_to_num(g.clone(), nan=0.0, posinf=0.0, neginf=0.0) for g in gradients
+        ]
         
         # Pairwise projection
         for i in range(len(adjusted_grads)):
@@ -281,13 +283,17 @@ class PCGradAggregator(Aggregator):
                     grad_j = adjusted_grads[j]
                     
                     # Compute dot product
-                    dot = torch.dot(grad_i, grad_j)
+                    dot = torch.sum(grad_i * grad_j)
                     
                     # If conflicting, project
-                    if dot < -self.epsilon:
+                    if dot.item() < -self.epsilon:
                         # Project grad_i onto grad_j
-                        proj = (dot / (torch.norm(grad_j)**2 + self.epsilon)) * grad_j
+                        denom = torch.clamp(grad_j.square().sum(), min=self.epsilon)
+                        proj = (dot / denom) * grad_j
                         adjusted_grads[i] = grad_i - proj
+                    adjusted_grads[i] = torch.nan_to_num(
+                        adjusted_grads[i], nan=0.0, posinf=0.0, neginf=0.0
+                    )
         
         # Return mean of adjusted gradients
         aggregated = torch.stack(adjusted_grads).mean(dim=0)
