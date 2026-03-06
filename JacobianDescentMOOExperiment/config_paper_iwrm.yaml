@@ -49,8 +49,8 @@ aggregators:
     type: "graddrop"
   - name: "IMTLG"
     type: "imtlg"
-  - name: "NashMTL"
-    type: "nashmtl"
+  #- name: "NashMTL"
+  #  type: "nashmtl"
   - name: "RGW"
     type: "rgw"
 
