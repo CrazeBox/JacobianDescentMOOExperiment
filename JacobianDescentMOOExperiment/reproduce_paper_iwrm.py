@@ -226,6 +226,9 @@ def auc_of_loss(loss_trace: List[float]) -> float:
         return float(loss_trace[0]) if loss_trace else float("inf")
     x = np.arange(len(loss_trace), dtype=float)
     y = np.array(loss_trace, dtype=float)
+    # NumPy 2.4 removed np.trapz in some builds; use trapezoid when available.
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y, x=x))
     return float(np.trapz(y, x=x))
 
 
@@ -456,4 +459,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
