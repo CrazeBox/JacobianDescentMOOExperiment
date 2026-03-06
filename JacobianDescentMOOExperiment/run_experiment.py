@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision
 import torchvision.transforms as transforms
 import numpy as np
@@ -33,17 +33,22 @@ def normalize_config(raw_config):
     dataset_cfg = raw_config.get('dataset', {})
     training_cfg = raw_config.get('training', {})
     logging_cfg = raw_config.get('logging', {})
+    model_cfg = raw_config.get('model', {})
 
     config = {}
     config['seed'] = raw_config.get('seed', experiment_cfg.get('seed', 42))
     config['device'] = raw_config.get(
         'device', experiment_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     )
+    config['run_seeds'] = raw_config.get('run_seeds', experiment_cfg.get('run_seeds', [config['seed']]))
 
     config['data_root'] = raw_config.get('data_root', dataset_cfg.get('data_root', './data'))
     config['num_tasks'] = raw_config.get('num_tasks', dataset_cfg.get('num_tasks', 5))
     config['classes_per_task'] = raw_config.get(
         'classes_per_task', dataset_cfg.get('classes_per_task', 2)
+    )
+    config['train_subset_size'] = raw_config.get(
+        'train_subset_size', dataset_cfg.get('train_subset_size', None)
     )
 
     config['num_epochs'] = raw_config.get('num_epochs', training_cfg.get('num_epochs', 200))
@@ -56,6 +61,10 @@ def normalize_config(raw_config):
         'weight_decay', training_cfg.get('weight_decay', 5e-4)
     )
     config['scheduler'] = raw_config.get('scheduler', training_cfg.get('scheduler', 'cosine'))
+    config['num_workers'] = raw_config.get('num_workers', training_cfg.get('num_workers', 2))
+    config['evaluate_test'] = raw_config.get('evaluate_test', training_cfg.get('evaluate_test', True))
+
+    config['architecture'] = raw_config.get('architecture', model_cfg.get('architecture', 'ResNet18'))
 
     config['aggregators'] = raw_config.get('aggregators', [])
 
@@ -137,6 +146,48 @@ class ResNet18MultiTask(nn.Module):
         features = features.view(features.size(0), -1)
         outputs = [head(features) for head in self.heads]
         return outputs
+
+
+class PaperCNNMultiTask(nn.Module):
+    """
+    Lightweight CNN close to the paper's CIFAR setup style (ELU activations).
+    """
+
+    def __init__(self, num_tasks: int = 5, num_classes_per_task: int = 2):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=5, stride=1, padding=2),
+            nn.ELU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ELU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ELU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.feature_dim = 128
+        self.heads = nn.ModuleList([
+            nn.Linear(self.feature_dim, num_classes_per_task)
+            for _ in range(num_tasks)
+        ])
+
+    def forward(self, x):
+        features = self.features(x)
+        features = features.view(features.size(0), -1)
+        outputs = [head(features) for head in self.heads]
+        return outputs
+
+
+def build_model(config, device):
+    arch = str(config.get('architecture', 'ResNet18')).lower()
+    num_tasks = int(config.get('num_tasks', 5))
+    classes_per_task = int(config.get('classes_per_task', 2))
+    if arch == 'papercnn':
+        model = PaperCNNMultiTask(num_tasks=num_tasks, num_classes_per_task=classes_per_task)
+    else:
+        model = ResNet18MultiTask(num_tasks=num_tasks, num_classes_per_task=classes_per_task)
+    return model.to(device)
 
 
 class JacobianDescentTrainer:
@@ -253,7 +304,8 @@ class JacobianDescentTrainer:
 
 def run_experiment(config):
     """Run full experiment."""
-    set_seed(config.get('seed', 42))
+    base_seed = int(config.get('seed', 42))
+    set_seed(base_seed)
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -274,27 +326,41 @@ def run_experiment(config):
     data_root = config.get('data_root', './data')
     os.makedirs(data_root, exist_ok=True)
     
-    train_dataset = MultiTaskCIFAR10(data_root, train=True, transform=transform_train)
+    full_train_dataset = MultiTaskCIFAR10(data_root, train=True, transform=transform_train)
     test_dataset = MultiTaskCIFAR10(data_root, train=False, transform=transform_test)
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.get('batch_size', 128), 
-        shuffle=True, 
-        num_workers=2,
-        pin_memory=(device == 'cuda')
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=config.get('batch_size', 128), 
-        shuffle=False, 
-        num_workers=2,
-        pin_memory=(device == 'cuda')
-    )
+
+    def make_loaders(run_seed):
+        train_dataset = full_train_dataset
+        subset_size = config.get('train_subset_size', None)
+        if subset_size is not None:
+            subset_size_i = int(subset_size)
+            subset_size_i = max(1, min(subset_size_i, len(full_train_dataset)))
+            subset_rng = torch.Generator().manual_seed(int(run_seed))
+            subset_idx = torch.randperm(
+                len(full_train_dataset), generator=subset_rng
+            )[:subset_size_i].tolist()
+            train_dataset = Subset(full_train_dataset, subset_idx)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.get('batch_size', 128),
+            shuffle=True,
+            num_workers=int(config.get('num_workers', 2)),
+            pin_memory=(device == 'cuda')
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.get('batch_size', 128),
+            shuffle=False,
+            num_workers=int(config.get('num_workers', 2)),
+            pin_memory=(device == 'cuda')
+        )
+        return train_loader, test_loader
     
     # Run experiments for each aggregator
     results = {}
     num_epochs = config.get('num_epochs', 200)
+    run_seeds = [int(s) for s in config.get('run_seeds', [base_seed])]
     
     for agg_config in config.get('aggregators', []):
         agg_name = agg_config['name']
@@ -304,76 +370,117 @@ def run_experiment(config):
         print(f"Training with {agg_name} aggregator")
         print(f"{'='*60}")
         
-        # Create model
-        model = ResNet18MultiTask(
-            num_tasks=config.get('num_tasks', 5),
-            num_classes_per_task=config.get('classes_per_task', 2)
-        ).to(device)
-        
-        # Create aggregator
-        aggregator = get_aggregator(agg_type, **{k: v for k, v in agg_config.items() if k not in ['name', 'type']})
-        
-        # Create trainer
-        trainer = JacobianDescentTrainer(
-            model, aggregator, device,
-            lr=config.get('learning_rate', 0.1),
-            momentum=config.get('momentum', 0.9),
-            weight_decay=config.get('weight_decay', 5e-4)
-        )
-        
-        # Learning rate scheduler
-        scheduler_name = str(config.get('scheduler', 'cosine')).lower()
-        if scheduler_name == 'cosine':
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                trainer.optimizer,
-                T_max=num_epochs
+        run_histories = []
+        for run_idx, run_seed in enumerate(run_seeds):
+            print(f"\n[{agg_name}] Run {run_idx + 1}/{len(run_seeds)} with seed={run_seed}")
+            set_seed(run_seed)
+            train_loader, test_loader = make_loaders(run_seed)
+            subset_size = config.get('train_subset_size', None)
+            if subset_size is not None:
+                print(f"[{agg_name}] Seed {run_seed}: train subset={int(subset_size)}")
+
+            # Create model
+            model = build_model(config, device)
+
+            # Create aggregator
+            aggregator = get_aggregator(
+                agg_type,
+                **{k: v for k, v in agg_config.items() if k not in ['name', 'type']}
             )
-        else:
-            scheduler = None
-        
-        # Training history
-        history = {
-            'train_cross_entropy': [],
-            'update_similarity_to_sgd': [],
-            'test_acc': [],
-            'per_task_acc': []
+
+            # Create trainer
+            trainer = JacobianDescentTrainer(
+                model, aggregator, device,
+                lr=config.get('learning_rate', 0.1),
+                momentum=config.get('momentum', 0.9),
+                weight_decay=config.get('weight_decay', 5e-4)
+            )
+
+            # Learning rate scheduler
+            scheduler_name = str(config.get('scheduler', 'none')).lower()
+            if scheduler_name == 'cosine':
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    trainer.optimizer,
+                    T_max=num_epochs
+                )
+            else:
+                scheduler = None
+
+            # Training history
+            history = {
+                'seed': run_seed,
+                'train_cross_entropy': [],
+                'update_similarity_to_sgd': [],
+                'test_acc': [],
+                'per_task_acc': []
+            }
+
+            # Training loop
+            for epoch in range(num_epochs):
+                train_losses, avg_similarity = trainer.train_epoch(train_loader)
+                avg_train_loss = sum(train_losses) / len(train_losses)
+
+                if config.get('evaluate_test', True):
+                    test_accs = trainer.evaluate(test_loader)
+                    avg_test_acc = sum(test_accs) / len(test_accs)
+                else:
+                    test_accs = []
+                    avg_test_acc = float('nan')
+
+                history['train_cross_entropy'].append(avg_train_loss)
+                history['update_similarity_to_sgd'].append(avg_similarity)
+                history['test_acc'].append(avg_test_acc)
+                history['per_task_acc'].append(test_accs)
+
+                if (epoch + 1) % max(1, int(config.get('eval_frequency', 10))) == 0 or epoch == 0:
+                    if config.get('evaluate_test', True):
+                        print(
+                            f"Epoch {epoch+1}/{num_epochs}: "
+                            f"CE={avg_train_loss:.4f}, "
+                            f"Sim(SGD)={avg_similarity:.4f}, "
+                            f"Avg Acc={avg_test_acc:.2f}%, "
+                            f"Tasks={[f'{acc:.1f}' for acc in test_accs]}"
+                        )
+                    else:
+                        print(
+                            f"Epoch {epoch+1}/{num_epochs}: "
+                            f"CE={avg_train_loss:.4f}, "
+                            f"Sim(SGD)={avg_similarity:.4f}"
+                        )
+
+                if scheduler is not None:
+                    scheduler.step()
+
+            run_histories.append(history)
+
+            # Save model checkpoint
+            if config.get('save_checkpoints', True):
+                checkpoint_dir = config.get('checkpoint_dir', './checkpoints')
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                torch.save({
+                    'epoch': num_epochs,
+                    'seed': run_seed,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    'history': history
+                }, os.path.join(checkpoint_dir, f'{agg_name}_seed{run_seed}_final.pth'))
+
+        # Aggregate across runs
+        ce_matrix = np.array([h['train_cross_entropy'] for h in run_histories], dtype=float)
+        sim_matrix = np.array([h['update_similarity_to_sgd'] for h in run_histories], dtype=float)
+
+        results[agg_name] = {
+            'runs': run_histories,
+            'train_cross_entropy_mean': ce_matrix.mean(axis=0).tolist(),
+            'train_cross_entropy_std': ce_matrix.std(axis=0).tolist(),
+            'update_similarity_to_sgd_mean': sim_matrix.mean(axis=0).tolist(),
+            'update_similarity_to_sgd_std': sim_matrix.std(axis=0).tolist()
         }
-        
-        # Training loop
-        for epoch in range(num_epochs):
-            train_losses, avg_similarity = trainer.train_epoch(train_loader)
-            avg_train_loss = sum(train_losses) / len(train_losses)
-            
-            test_accs = trainer.evaluate(test_loader)
-            avg_test_acc = sum(test_accs) / len(test_accs)
-            
-            history['train_cross_entropy'].append(avg_train_loss)
-            history['update_similarity_to_sgd'].append(avg_similarity)
-            history['test_acc'].append(avg_test_acc)
-            history['per_task_acc'].append(test_accs)
-            
-            if (epoch + 1) % max(1, int(config.get('eval_frequency', 10))) == 0 or epoch == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}: "
-                      f"CE={avg_train_loss:.4f}, "
-                      f"Sim(SGD)={avg_similarity:.4f}, "
-                      f"Avg Acc={avg_test_acc:.2f}%, "
-                      f"Tasks={[f'{acc:.1f}' for acc in test_accs]}")
-            
-            if scheduler is not None:
-                scheduler.step()
-        
-        results[agg_name] = history
-        
-        # Save model checkpoint
-        if config.get('save_checkpoints', True):
-            checkpoint_dir = config.get('checkpoint_dir', './checkpoints')
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            torch.save({
-                'epoch': num_epochs,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': trainer.optimizer.state_dict(),
-                'history': history
-            }, os.path.join(checkpoint_dir, f'{agg_name}_final.pth'))
+
+        if config.get('evaluate_test', True):
+            acc_matrix = np.array([h['test_acc'] for h in run_histories], dtype=float)
+            results[agg_name]['test_acc_mean'] = acc_matrix.mean(axis=0).tolist()
+            results[agg_name]['test_acc_std'] = acc_matrix.std(axis=0).tolist()
     
     return results
 
@@ -384,7 +491,7 @@ def plot_results(results, save_path='results.png'):
     
     # Training cross-entropy
     for agg_name, history in results.items():
-        axes[0].plot(history['train_cross_entropy'], label=agg_name, linewidth=2)
+        axes[0].plot(history['train_cross_entropy_mean'], label=agg_name, linewidth=2)
     axes[0].set_xlabel('Epoch', fontsize=12)
     axes[0].set_ylabel('Training Cross-Entropy', fontsize=12)
     axes[0].set_title('Training Cross-Entropy over Epochs', fontsize=14)
@@ -393,7 +500,7 @@ def plot_results(results, save_path='results.png'):
     
     # Update similarity to SGD
     for agg_name, history in results.items():
-        axes[1].plot(history['update_similarity_to_sgd'], label=agg_name, linewidth=2)
+        axes[1].plot(history['update_similarity_to_sgd_mean'], label=agg_name, linewidth=2)
     axes[1].set_xlabel('Epoch', fontsize=12)
     axes[1].set_ylabel('Cosine Similarity', fontsize=12)
     axes[1].set_title('Update Similarity to SGD over Epochs', fontsize=14)
@@ -409,18 +516,17 @@ def plot_results(results, save_path='results.png'):
     print("FINAL RESULTS")
     print("="*60)
     for agg_name, history in results.items():
-        final_acc = history['test_acc'][-1]
-        final_task_accs = history['per_task_acc'][-1]
-        final_ce = history['train_cross_entropy'][-1]
-        final_sim = history['update_similarity_to_sgd'][-1]
+        final_ce = history['train_cross_entropy_mean'][-1]
+        final_sim = history['update_similarity_to_sgd_mean'][-1]
+        final_ce_std = history['train_cross_entropy_std'][-1]
+        final_sim_std = history['update_similarity_to_sgd_std'][-1]
         print(f"\n{agg_name}:")
-        print(f"  Final Training Cross-Entropy: {final_ce:.4f}")
-        print(f"  Final Update Similarity to SGD: {final_sim:.4f}")
-        print(f"  Average Accuracy: {final_acc:.2f}%")
-        print(f"  Per-task Accuracies: {[f'{acc:.2f}%' for acc in final_task_accs]}")
-        print(f"  Min Task Accuracy: {min(final_task_accs):.2f}%")
-        print(f"  Max Task Accuracy: {max(final_task_accs):.2f}%")
-        print(f"  Fairness (std): {np.std(final_task_accs):.2f}")
+        print(f"  Final Training Cross-Entropy: {final_ce:.4f} +- {final_ce_std:.4f}")
+        print(f"  Final Update Similarity to SGD: {final_sim:.4f} +- {final_sim_std:.4f}")
+        if 'test_acc_mean' in history:
+            final_acc = history['test_acc_mean'][-1]
+            final_acc_std = history['test_acc_std'][-1]
+            print(f"  Average Accuracy: {final_acc:.2f}% +- {final_acc_std:.2f}%")
 
 
 def main():

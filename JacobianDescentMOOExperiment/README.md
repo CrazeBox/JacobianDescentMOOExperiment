@@ -26,12 +26,14 @@ This repository reproduces the CIFAR-10 experiments from the paper:
 - **Input size**: 32×32 RGB images
 
 ### Training Configuration
-- **Epochs**: 200
+- **Epochs**: 20 (paper-aligned default for CIFAR-10 optimization study)
 - **Batch size**: 128
-- **Learning rate**: 0.1 (with cosine annealing)
-- **Optimizer**: SGD with momentum 0.9
-- **Weight decay**: 5e-4
+- **Learning rate**: 0.1 (constant by default)
+- **Optimizer**: SGD with momentum 0.0
+- **Weight decay**: 0.0
 - **Data augmentation**: Random crop, horizontal flip
+- **Train subset**: 1024 samples
+- **Repeated runs**: 8 seeds by default (`experiment.run_seeds`)
 
 ### Aggregators Implemented
 1. **Mean**: Simple average of task gradients (baseline)
@@ -52,6 +54,8 @@ pip install -r requirements.txt
 ```bash
 python run_experiment.py --config config.yaml
 ```
+
+The script now aggregates metrics across multiple seeds and reports mean/std.
 
 ### Run with specific device
 ```bash

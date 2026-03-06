@@ -4,32 +4,36 @@
 experiment:
   name: "JD_CIFAR10_Reproduction"
   seed: 42
+  run_seeds: [0, 1, 2, 3, 4, 5, 6, 7]
   device: "cuda"  # or "cpu"
   
 dataset:
   name: "CIFAR10"
   num_tasks: 5
   classes_per_task: 2
+  train_subset_size: 1024
   data_root: "./data"
   
 model:
-  architecture: "ResNet18"
+  architecture: "PaperCNN"  # Paper-style lightweight CNN with ELU
   pretrained: false
   
 training:
-  num_epochs: 200
+  num_epochs: 20
   batch_size: 128
   learning_rate: 0.1
-  momentum: 0.9
-  weight_decay: 0.0005
-  scheduler: "cosine"
+  momentum: 0.0
+  weight_decay: 0.0
+  scheduler: "none"
+  num_workers: 2
+  evaluate_test: true
   
 aggregators:
   - name: "Mean"
     type: "mean"
   - name: "UPGrad"
     type: "upgrad"
-    epsilon: 1e-8
+    epsilon: 1.0e-8
   - name: "MGDA"
     type: "mgda"
   - name: "CAGrad"
