@@ -23,9 +23,35 @@ def _solve_problem_quietly(prob):
     """Solve CVXPY problem while suppressing noisy solver stdout/stderr."""
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         try:
-            prob.solve(solver=cp.OSQP, verbose=False, polish=False, warm_start=True)
+            prob.solve(solver=cp.SCS, verbose=False, warm_start=True)
         except Exception:
-            prob.solve(verbose=False)
+            try:
+                prob.solve(solver=cp.OSQP, verbose=False, polish=False, warm_start=True)
+            except Exception:
+                prob.solve(verbose=False)
+
+
+def _stable_gram_matrix(J: torch.Tensor, epsilon: float) -> np.ndarray:
+    """
+    Build a numerically stable PSD Gram matrix for CVXPY:
+    - enforce symmetry
+    - move to float64
+    - shift diagonal if tiny negative eigenvalues appear
+    """
+    m = J.size(0)
+    G = torch.matmul(J, J.t())
+    G = 0.5 * (G + G.t())
+    G = G + float(epsilon) * torch.eye(m, device=G.device, dtype=G.dtype)
+    G_np = G.detach().double().cpu().numpy()
+    G_np = 0.5 * (G_np + G_np.T)
+    try:
+        eig_min = float(np.linalg.eigvalsh(G_np).min())
+        if eig_min < 1e-10:
+            G_np = G_np + (abs(eig_min) + 1e-8) * np.eye(m, dtype=np.float64)
+    except Exception:
+        # If eigendecomposition fails, still keep a conservative diagonal shift.
+        G_np = G_np + 1e-6 * np.eye(m, dtype=np.float64)
+    return G_np
 
 
 class Aggregator:
@@ -75,8 +101,7 @@ class UPGradAggregator(Aggregator):
         
         # Compute Gram matrix G = J @ J^T
         G = torch.matmul(J, J.t())
-        
-        # Add regularization for numerical stability
+        G = 0.5 * (G + G.t())
         G = G + self.epsilon * torch.eye(m, device=G.device)
         
         # Solve for optimal weights using QP formulation
@@ -94,14 +119,14 @@ class UPGradAggregator(Aggregator):
                 else:
                     weights = weights / torch.sum(weights)
             else:
-                # Convert to numpy for CVXPY
-                G_np = G.cpu().numpy()
+                # Convert to stable PSD numpy matrix for CVXPY
+                G_np = _stable_gram_matrix(J, self.epsilon)
                 
                 # Define optimization variable
                 w = cp.Variable(m)
                 
                 # Define objective: minimize 0.5 * w^T G w - sum(w)
-                objective = cp.Minimize(0.5 * cp.quad_form(w, G_np) - cp.sum(w))
+                objective = cp.Minimize(0.5 * cp.quad_form(w, cp.psd_wrap(G_np)) - cp.sum(w))
                 
                 # Constraints: w >= 0
                 constraints = [w >= 0]
@@ -117,8 +142,7 @@ class UPGradAggregator(Aggregator):
                 else:
                     # Fallback to uniform weights
                     weights = torch.ones(m, dtype=J.dtype, device=J.device) / m
-        except Exception as e:
-            print(f"QP solver failed: {e}, using uniform weights")
+        except Exception:
             weights = torch.ones(m, dtype=J.dtype, device=J.device) / m
         
         # Compute weighted combination
@@ -146,6 +170,7 @@ class MGDAAggregator(Aggregator):
         
         # Compute Gram matrix
         G = torch.matmul(J, J.t())
+        G = 0.5 * (G + G.t())
         G = G + self.epsilon * torch.eye(m, device=G.device)
         
         try:
@@ -153,13 +178,13 @@ class MGDAAggregator(Aggregator):
                 # Fallback when cvxpy is unavailable.
                 weights = torch.ones(m, dtype=J.dtype, device=J.device) / m
             else:
-                # Solve min ||sum(w_i * grad_i)||^2 s.t. sum(w_i) = 1, w_i >= 0
-                G_np = G.cpu().numpy()
+                # Solve min ||sum(w_i * grad_i)||^2 s.t. sum(w_i)=1, w_i>=0
+                G_np = _stable_gram_matrix(J, self.epsilon)
                 
                 w = cp.Variable(m)
                 
                 # Objective: minimize w^T G w (norm of weighted sum)
-                objective = cp.Minimize(cp.quad_form(w, G_np))
+                objective = cp.Minimize(cp.quad_form(w, cp.psd_wrap(G_np)))
                 
                 # Constraints
                 constraints = [
@@ -174,8 +199,7 @@ class MGDAAggregator(Aggregator):
                     weights = torch.tensor(w.value, dtype=J.dtype, device=J.device)
                 else:
                     weights = torch.ones(m, dtype=J.dtype, device=J.device) / m
-        except Exception as e:
-            print(f"MGDA solver failed: {e}, using uniform weights")
+        except Exception:
             weights = torch.ones(m, dtype=J.dtype, device=J.device) / m
         
         aggregated = torch.matmul(weights, J)
