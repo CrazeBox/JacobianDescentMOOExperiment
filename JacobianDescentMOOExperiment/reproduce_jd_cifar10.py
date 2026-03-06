@@ -29,14 +29,32 @@ CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2023, 0.1994, 0.2010)
 
 
+def has_cifar10_data(root: str) -> bool:
+    """Return True if CIFAR-10 extracted files are already present under root."""
+    base_dir = os.path.join(root, "cifar-10-batches-py")
+    required = [
+        "data_batch_1",
+        "data_batch_2",
+        "data_batch_3",
+        "data_batch_4",
+        "data_batch_5",
+        "test_batch",
+        "batches.meta",
+    ]
+    return os.path.isdir(base_dir) and all(
+        os.path.exists(os.path.join(base_dir, name)) for name in required
+    )
+
+
 class MultiTaskCIFAR10(Dataset):
     """
     CIFAR-10 dataset for multi-task learning.
     Creates 5 binary classification tasks from 10 classes.
     """
     def __init__(self, root: str, train: bool = True, transform=None):
+        download = not has_cifar10_data(root)
         self.dataset = torchvision.datasets.CIFAR10(
-            root=root, train=train, download=True, transform=transform
+            root=root, train=train, download=download, transform=transform
         )
         # Map 10 classes to 5 binary tasks
         # Task 0: classes 0,1 vs others
