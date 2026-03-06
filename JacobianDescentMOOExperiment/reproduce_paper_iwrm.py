@@ -240,6 +240,7 @@ def select_lr(
     agg_kwargs: Dict,
     cfg: Dict,
     device: str,
+    show_bar: bool,
 ) -> Tuple[float, List[Dict]]:
     search_cfg = cfg.get("learning_rate_search", {})
     enabled = bool(search_cfg.get("enabled", True))
@@ -266,7 +267,7 @@ def select_lr(
             lr=lr,
             momentum=float(cfg["training"]["momentum"]),
             weight_decay=float(cfg["training"]["weight_decay"]),
-            show_bar=False,
+            show_bar=show_bar,
         )
         score = auc_of_loss(losses)
         return score
@@ -371,6 +372,7 @@ def main() -> None:
     os.makedirs(data_root, exist_ok=True)
     output_dir = cfg.get("logging", {}).get("log_dir", "./logs_paper")
     os.makedirs(output_dir, exist_ok=True)
+    show_progress = bool(cfg.get("logging", {}).get("show_progress", False))
 
     print(f"Using device: {device}")
     print(f"Seeds: {run_seeds}")
@@ -411,6 +413,7 @@ def main() -> None:
                 agg_kwargs=agg_kwargs,
                 cfg=cfg,
                 device=device,
+                show_bar=show_progress,
             )
             lr_trials_per_seed[str(seed)] = lr_trials
 
@@ -427,7 +430,7 @@ def main() -> None:
                 lr=best_lr,
                 momentum=momentum,
                 weight_decay=weight_decay,
-                show_bar=False,
+                show_bar=show_progress,
             )
             traces.append(
                 RunTrace(
