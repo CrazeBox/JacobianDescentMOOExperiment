@@ -71,6 +71,10 @@ This pipeline implements:
 - Reporting mean/SEM curves for:
   - training cross-entropy
   - update cosine similarity to SGD
+- Resume support for long jobs:
+  - set `logging.resume: true`
+  - completed `(aggregator, seed)` runs are saved under `<log_dir>/partial/`
+  - re-launching the same command skips completed seeds automatically
 
 `config_paper_iwrm.yaml` includes additional methods (`DualProj`, `AlignedMTL`, `GradDrop`, `IMTLG`, `NashMTL`) that are loaded through `torchjd`.
 

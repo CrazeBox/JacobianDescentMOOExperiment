@@ -99,6 +99,28 @@ class RunTrace:
     sim_to_sgd_per_iter: List[float]
 
 
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in name).strip("_").lower()
+
+
+def runtrace_to_dict(trace: RunTrace) -> Dict:
+    return {
+        "seed": trace.seed,
+        "best_lr": trace.best_lr,
+        "train_loss_per_iter": trace.train_loss_per_iter,
+        "sim_to_sgd_per_iter": trace.sim_to_sgd_per_iter,
+    }
+
+
+def runtrace_from_dict(data: Dict) -> RunTrace:
+    return RunTrace(
+        seed=int(data["seed"]),
+        best_lr=float(data["best_lr"]),
+        train_loss_per_iter=list(data["train_loss_per_iter"]),
+        sim_to_sgd_per_iter=list(data["sim_to_sgd_per_iter"]),
+    )
+
+
 def load_config(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
@@ -380,6 +402,9 @@ def main() -> None:
     output_dir = cfg.get("logging", {}).get("log_dir", "./logs_paper")
     os.makedirs(output_dir, exist_ok=True)
     show_progress = bool(cfg.get("logging", {}).get("show_progress", False))
+    resume_enabled = bool(cfg.get("logging", {}).get("resume", True))
+    partial_dir = os.path.join(output_dir, "partial")
+    os.makedirs(partial_dir, exist_ok=True)
 
     print(f"Using device: {device}")
     print(f"Seeds: {run_seeds}")
@@ -399,6 +424,20 @@ def main() -> None:
         lr_trials_per_seed: Dict[str, List[Dict]] = {}
 
         for seed in run_seeds:
+            partial_path = os.path.join(
+                partial_dir, f"{_safe_name(agg_name)}_seed{int(seed)}.json"
+            )
+            if resume_enabled and os.path.exists(partial_path):
+                with open(partial_path, "r", encoding="utf-8") as f:
+                    partial_data = json.load(f)
+                traces.append(runtrace_from_dict(partial_data["run_trace"]))
+                lr_trials_per_seed[str(seed)] = partial_data.get("lr_trials", [])
+                print(
+                    f"[{agg_name}] seed={seed} loaded from partial checkpoint, "
+                    f"skip recompute."
+                )
+                continue
+
             set_seed(seed)
             loader = make_subset_loader(
                 data_root=data_root,
@@ -447,6 +486,19 @@ def main() -> None:
                     sim_to_sgd_per_iter=sim_trace,
                 )
             )
+            with open(partial_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "aggregator": agg_name,
+                        "type": agg_type,
+                        "seed": int(seed),
+                        "run_trace": runtrace_to_dict(traces[-1]),
+                        "lr_trials": lr_trials,
+                    },
+                    f,
+                    indent=2,
+                )
+                f.flush()
             print(
                 f"[{agg_name}] seed={seed} done. final_loss={loss_trace[-1]:.6f}, "
                 f"final_sim={sim_trace[-1]:.6f}, lr={best_lr:.8f}"
@@ -455,6 +507,9 @@ def main() -> None:
         agg_result = aggregate_runs(traces)
         agg_result["lr_trials"] = lr_trials_per_seed
         all_results[agg_name] = agg_result
+        # Persist merged results after each aggregator for safer long runs.
+        with open(os.path.join(output_dir, "results.json"), "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2)
 
     out_json = os.path.join(output_dir, "results.json")
     out_png = os.path.join(output_dir, "results.png")

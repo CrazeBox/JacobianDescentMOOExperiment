@@ -57,3 +57,4 @@ aggregators:
 logging:
   log_dir: "./logs_paper_iwrm"
   show_progress: true
+  resume: true
