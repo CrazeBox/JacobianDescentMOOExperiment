@@ -97,6 +97,7 @@ class RunTrace:
     best_lr: float
     train_loss_per_iter: List[float]
     sim_to_sgd_per_iter: List[float]
+    health_stats: Dict[str, int]
 
 
 def _safe_name(name: str) -> str:
@@ -109,6 +110,7 @@ def runtrace_to_dict(trace: RunTrace) -> Dict:
         "best_lr": trace.best_lr,
         "train_loss_per_iter": trace.train_loss_per_iter,
         "sim_to_sgd_per_iter": trace.sim_to_sgd_per_iter,
+        "health_stats": trace.health_stats,
     }
 
 
@@ -118,6 +120,17 @@ def runtrace_from_dict(data: Dict) -> RunTrace:
         best_lr=float(data["best_lr"]),
         train_loss_per_iter=list(data["train_loss_per_iter"]),
         sim_to_sgd_per_iter=list(data["sim_to_sgd_per_iter"]),
+        health_stats=dict(
+            data.get(
+                "health_stats",
+                {
+                    "total_batches": 0,
+                    "skipped_nonfinite_loss_batches": 0,
+                    "sanitized_j_batches": 0,
+                    "sanitized_agg_batches": 0,
+                },
+            )
+        ),
     )
 
 
@@ -199,7 +212,7 @@ def train_one_run(
     momentum: float,
     weight_decay: float,
     show_bar: bool = False,
-) -> Tuple[List[float], List[float]]:
+) -> Tuple[List[float], List[float], Dict[str, int]]:
     model.train()
     criterion = nn.CrossEntropyLoss(reduction="none")
     optimizer = optim.SGD(
@@ -210,9 +223,16 @@ def train_one_run(
     loss_trace: List[float] = []
     sim_trace: List[float] = []
     bar_disable = not show_bar
+    stats = {
+        "total_batches": 0,
+        "skipped_nonfinite_loss_batches": 0,
+        "sanitized_j_batches": 0,
+        "sanitized_agg_batches": 0,
+    }
 
     for _ in range(num_epochs):
         for x, y in tqdm(loader, desc="Train", leave=False, disable=bar_disable):
+            stats["total_batches"] += 1
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -221,6 +241,7 @@ def train_one_run(
             per_sample_losses = criterion(logits, y)  # [batch]
             if not torch.isfinite(per_sample_losses).all():
                 # Skip unstable batch to avoid propagating NaN/Inf into Jacobian rows.
+                stats["skipped_nonfinite_loss_batches"] += 1
                 continue
 
             jac_rows = []
@@ -232,9 +253,11 @@ def train_one_run(
             J = torch.stack(jac_rows, dim=0)  # [m, n]
             if not torch.isfinite(J).all():
                 J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
+                stats["sanitized_j_batches"] += 1
             agg = aggregator([row for row in J])
             if not torch.isfinite(agg).all():
                 agg = torch.nan_to_num(agg, nan=0.0, posinf=0.0, neginf=0.0)
+                stats["sanitized_agg_batches"] += 1
             mean_grad = J.mean(dim=0)
             sim = torch.nn.functional.cosine_similarity(
                 agg.unsqueeze(0), mean_grad.unsqueeze(0), dim=1, eps=1e-12
@@ -247,7 +270,7 @@ def train_one_run(
             loss_trace.append(per_sample_losses.mean().item())
             sim_trace.append(sim)
 
-    return loss_trace, sim_trace
+    return loss_trace, sim_trace, stats
 
 
 def auc_of_loss(loss_trace: List[float]) -> float:
@@ -287,7 +310,7 @@ def select_lr(
         model = PaperCIFARNet().to(device)
         model.load_state_dict(base_model_state)
         aggregator = get_aggregator(agg_type, **agg_kwargs)
-        losses, _ = train_one_run(
+        losses, _, _ = train_one_run(
             model=model,
             loader=loader,
             aggregator=aggregator,
@@ -321,8 +344,28 @@ def select_lr(
 
 
 def aggregate_runs(traces: List[RunTrace]) -> Dict:
-    loss_mat = np.array([t.train_loss_per_iter for t in traces], dtype=float)
-    sim_mat = np.array([t.sim_to_sgd_per_iter for t in traces], dtype=float)
+    if len(traces) == 0:
+        raise ValueError("No run traces to aggregate.")
+
+    loss_lengths = [len(t.train_loss_per_iter) for t in traces]
+    sim_lengths = [len(t.sim_to_sgd_per_iter) for t in traces]
+    common_len = min(min(loss_lengths), min(sim_lengths))
+    if common_len <= 0:
+        raise ValueError(
+            f"Cannot aggregate empty traces. loss_lengths={loss_lengths}, sim_lengths={sim_lengths}"
+        )
+    if len(set(loss_lengths)) > 1 or len(set(sim_lengths)) > 1:
+        print(
+            f"[aggregate_runs] variable trace lengths detected, truncating to common_len={common_len}. "
+            f"loss_lengths={loss_lengths}, sim_lengths={sim_lengths}"
+        )
+
+    loss_mat = np.array(
+        [t.train_loss_per_iter[:common_len] for t in traces], dtype=float
+    )
+    sim_mat = np.array(
+        [t.sim_to_sgd_per_iter[:common_len] for t in traces], dtype=float
+    )
     n = loss_mat.shape[0]
     denom = max(1, int(math.sqrt(n)))
 
@@ -333,6 +376,7 @@ def aggregate_runs(traces: List[RunTrace]) -> Dict:
                 "best_lr": t.best_lr,
                 "train_loss_per_iter": t.train_loss_per_iter,
                 "sim_to_sgd_per_iter": t.sim_to_sgd_per_iter,
+                "health_stats": t.health_stats,
             }
             for t in traces
         ],
@@ -340,6 +384,18 @@ def aggregate_runs(traces: List[RunTrace]) -> Dict:
         "train_loss_sem": (loss_mat.std(axis=0, ddof=0) / denom).tolist(),
         "sim_to_sgd_mean": sim_mat.mean(axis=0).tolist(),
         "sim_to_sgd_sem": (sim_mat.std(axis=0, ddof=0) / denom).tolist(),
+        "health_summary": {
+            "total_batches": int(sum(t.health_stats.get("total_batches", 0) for t in traces)),
+            "skipped_nonfinite_loss_batches": int(
+                sum(t.health_stats.get("skipped_nonfinite_loss_batches", 0) for t in traces)
+            ),
+            "sanitized_j_batches": int(
+                sum(t.health_stats.get("sanitized_j_batches", 0) for t in traces)
+            ),
+            "sanitized_agg_batches": int(
+                sum(t.health_stats.get("sanitized_agg_batches", 0) for t in traces)
+            ),
+        },
     }
 
 
@@ -467,7 +523,7 @@ def main() -> None:
             model.load_state_dict(init_state)
             aggregator = get_aggregator(agg_type, **agg_kwargs)
 
-            loss_trace, sim_trace = train_one_run(
+            loss_trace, sim_trace, health_stats = train_one_run(
                 model=model,
                 loader=loader,
                 aggregator=aggregator,
@@ -484,6 +540,7 @@ def main() -> None:
                     best_lr=best_lr,
                     train_loss_per_iter=loss_trace,
                     sim_to_sgd_per_iter=sim_trace,
+                    health_stats=health_stats,
                 )
             )
             with open(partial_path, "w", encoding="utf-8") as f:
@@ -501,7 +558,8 @@ def main() -> None:
                 f.flush()
             print(
                 f"[{agg_name}] seed={seed} done. final_loss={loss_trace[-1]:.6f}, "
-                f"final_sim={sim_trace[-1]:.6f}, lr={best_lr:.8f}"
+                f"final_sim={sim_trace[-1]:.6f}, lr={best_lr:.8f}, "
+                f"skipped={health_stats.get('skipped_nonfinite_loss_batches', 0)}"
             )
 
         agg_result = aggregate_runs(traces)
