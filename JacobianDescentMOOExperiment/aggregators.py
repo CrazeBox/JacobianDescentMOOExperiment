@@ -316,7 +316,12 @@ class TorchJDAggregator(Aggregator):
 
     def __call__(self, gradients: List[torch.Tensor]) -> torch.Tensor:
         J = torch.stack(gradients)
-        return self.inner(J)
+        try:
+            return self.inner(J)
+        except Exception as e:
+            # Fall back to mean to keep training running on ill-conditioned cases.
+            print(f"torchjd aggregator failed ({type(e).__name__}): {e}. Using mean.")
+            return J.mean(dim=0)
 
 
 def get_aggregator(name: str, **kwargs) -> Aggregator:
