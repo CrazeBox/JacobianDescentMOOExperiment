@@ -397,7 +397,9 @@ def train_one_run(
 
                 if mean_grad is None:
                     optimizer.zero_grad(set_to_none=True)
-                    per_sample_losses.mean().backward(retain_graph=False)
+                    logits = model(x)
+                    per_sample_losses_mean = criterion(logits, y).mean()
+                    per_sample_losses_mean.backward()
                     mean_grad = flatten_grads(params)
 
                 sim = torch.nn.functional.cosine_similarity(
