@@ -293,7 +293,18 @@ def train_one_run(
         if upgrad_weighting is None:
             raise ValueError("torchjd.aggregation.UPGradWeighting is unavailable.")
         epsilon = float(agg_kwargs.get("epsilon", 1e-8))
-        upgrad_weighting = upgrad_weighting(epsilon=epsilon)
+        try:
+            import inspect
+
+            sig = inspect.signature(upgrad_weighting.__init__)
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                upgrad_weighting = upgrad_weighting(epsilon=epsilon)
+            elif "epsilon" in sig.parameters:
+                upgrad_weighting = upgrad_weighting(epsilon=epsilon)
+            else:
+                upgrad_weighting = upgrad_weighting()
+        except Exception:
+            upgrad_weighting = upgrad_weighting()
 
     for _ in range(num_epochs):
         for x, y in tqdm(loader, desc="Train", leave=False, disable=bar_disable):
