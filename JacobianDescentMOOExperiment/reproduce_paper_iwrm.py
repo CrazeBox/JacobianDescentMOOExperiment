@@ -18,6 +18,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -350,6 +352,9 @@ def train_one_run(
                     if tj_backward is None:
                         raise ImportError("torchjd is required for autojac backend.")
                     try:
+                        for p in params:
+                            if hasattr(p, "jac"):
+                                delattr(p, "jac")
                         optimizer.zero_grad(set_to_none=True)
                         tj_backward(per_sample_losses, inputs=params)
                         jac_blocks = []
@@ -357,7 +362,7 @@ def train_one_run(
                             if not hasattr(p, "jac") or p.jac is None:
                                 raise RuntimeError("torchjd autojac did not populate .jac")
                             jac_blocks.append(p.jac.reshape(p.jac.size(0), -1))
-                            p.jac = None
+                            delattr(p, "jac")
                         J = torch.cat(jac_blocks, dim=1)  # [m, n]
                         if not torch.isfinite(J).all():
                             J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
@@ -369,7 +374,9 @@ def train_one_run(
                             f"torchjd autojac failed ({type(e).__name__}): {e}. Using mean."
                         )
                         optimizer.zero_grad(set_to_none=True)
-                        per_sample_losses.mean().backward()
+                        logits = model(x)
+                        per_sample_losses_fallback = criterion(logits, y)
+                        per_sample_losses_fallback.mean().backward()
                         agg_grad = flatten_grads(params)
                         mean_grad = agg_grad
 
