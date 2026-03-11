@@ -402,4 +402,16 @@ def get_torchjd_aggregator(name: str, **kwargs):
     cls = getattr(tjagg, class_name, None)
     if cls is None:
         raise ValueError(f"torchjd.aggregation has no class '{class_name}'.")
-    return cls(**kwargs)
+    if not kwargs:
+        return cls()
+    try:
+        import inspect
+
+        sig = inspect.signature(cls.__init__)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return cls(**kwargs)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return cls(**filtered)
+    except Exception:
+        # Fallback: attempt without kwargs
+        return cls()
