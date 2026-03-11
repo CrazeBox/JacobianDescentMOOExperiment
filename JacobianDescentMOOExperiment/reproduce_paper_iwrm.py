@@ -333,12 +333,6 @@ def train_one_run(
                 assign_flat_grad(params, agg)
                 optimizer.step()
             else:
-                # Compute mean gradient for cosine similarity
-                optimizer.zero_grad(set_to_none=True)
-                per_sample_losses.mean().backward(retain_graph=True)
-                mean_grad = flatten_grads(params)
-
-                optimizer.zero_grad(set_to_none=True)
                 if backend == "autogram":
                     gramian = engine.compute_gramian(per_sample_losses)
                     if not torch.isfinite(gramian).all():
@@ -348,24 +342,45 @@ def train_one_run(
                     if not torch.isfinite(weights).all():
                         weights = torch.ones_like(weights) / weights.numel()
                         stats["sanitized_agg_batches"] += 1
+                    optimizer.zero_grad(set_to_none=True)
                     per_sample_losses.backward(weights)
+                    agg_grad = flatten_grads(params)
+                    mean_grad = None
                 else:
                     if tj_backward is None:
                         raise ImportError("torchjd is required for autojac backend.")
                     try:
-                        tj_backward(per_sample_losses, aggregator)
+                        optimizer.zero_grad(set_to_none=True)
+                        tj_backward(per_sample_losses, inputs=params)
+                        jac_blocks = []
+                        for p in params:
+                            if not hasattr(p, "jac") or p.jac is None:
+                                raise RuntimeError("torchjd autojac did not populate .jac")
+                            jac_blocks.append(p.jac.reshape(p.jac.size(0), -1))
+                            p.jac = None
+                        J = torch.cat(jac_blocks, dim=1)  # [m, n]
+                        if not torch.isfinite(J).all():
+                            J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
+                            stats["sanitized_j_batches"] += 1
+                        mean_grad = J.mean(dim=0)
+                        agg_grad = aggregator(J)
                     except Exception as e:
-                        # Fallback to mean gradient on failure.
                         print(
                             f"torchjd autojac failed ({type(e).__name__}): {e}. Using mean."
                         )
                         optimizer.zero_grad(set_to_none=True)
                         per_sample_losses.mean().backward()
+                        agg_grad = flatten_grads(params)
+                        mean_grad = agg_grad
 
-                agg_grad = flatten_grads(params)
                 if not torch.isfinite(agg_grad).all():
                     agg_grad = torch.nan_to_num(agg_grad, nan=0.0, posinf=0.0, neginf=0.0)
                     stats["sanitized_agg_batches"] += 1
+
+                if mean_grad is None:
+                    optimizer.zero_grad(set_to_none=True)
+                    per_sample_losses.mean().backward(retain_graph=False)
+                    mean_grad = flatten_grads(params)
 
                 sim = torch.nn.functional.cosine_similarity(
                     agg_grad.unsqueeze(0), mean_grad.unsqueeze(0), dim=1, eps=1e-12
