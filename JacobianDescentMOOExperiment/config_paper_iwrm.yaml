@@ -18,6 +18,11 @@ training:
   momentum: 0.0
   weight_decay: 0.0
   num_workers: 2
+  # Backend for IWRM/SSJD:
+  # "manual"   : explicit per-sample Jacobian (slow, no torchjd required)
+  # "autojac"  : torchjd.autojac backward (official-style)
+  # "autogram" : torchjd.autogram (UPGrad only, fastest)
+  iwrm_backend: "autogram"
 
 learning_rate_search:
   enabled: true
@@ -43,18 +48,9 @@ aggregators:
     type: "pcgrad"
   - name: "DualProj"
     type: "dualproj"
-  - name: "AlignedMTL"
-    type: "alignedmtl"
-  - name: "GradDrop"
-    type: "graddrop"
-  - name: "IMTLG"
-    type: "imtlg"
-  #- name: "NashMTL"
-  #  type: "nashmtl"
-  - name: "RGW"
-    type: "rgw"
 
 logging:
   log_dir: "./logs_paper_iwrm"
   show_progress: true
   resume: true
+  skip_completed: true

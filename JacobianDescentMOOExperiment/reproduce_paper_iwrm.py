@@ -29,7 +29,22 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from aggregators import get_aggregator
+from aggregators import get_aggregator, get_torchjd_aggregator
+
+try:
+    from torchjd.autojac import backward as tj_backward
+except Exception:
+    tj_backward = None
+
+try:
+    from torchjd.autogram import Engine as TJEngine
+except Exception:
+    TJEngine = None
+
+try:
+    import torchjd.aggregation as tjagg
+except Exception:
+    tjagg = None
 
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
@@ -140,6 +155,38 @@ def load_config(path: str) -> Dict:
     return cfg
 
 
+def load_existing_results(path: str) -> Dict[str, Dict]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def build_completed_cache(existing_results: Dict) -> Tuple[Dict[str, Dict[int, RunTrace]], Dict[str, Dict]]:
+    completed: Dict[str, Dict[int, RunTrace]] = {}
+    lr_trials_cache: Dict[str, Dict] = {}
+    for agg_name, data in existing_results.items():
+        runs = data.get("runs", [])
+        by_seed: Dict[int, RunTrace] = {}
+        if isinstance(runs, list):
+            for item in runs:
+                try:
+                    trace = runtrace_from_dict(item)
+                    by_seed[int(trace.seed)] = trace
+                except (KeyError, TypeError, ValueError):
+                    continue
+        if by_seed:
+            completed[agg_name] = by_seed
+        lr_trials_cache[agg_name] = data.get("lr_trials", {})
+    return completed, lr_trials_cache
+
+
 def build_lr_grid(lr_cfg: Dict) -> Tuple[np.ndarray, np.ndarray]:
     min_exp = float(lr_cfg.get("coarse_min_exp", -5.0))
     max_exp = float(lr_cfg.get("coarse_max_exp", 2.0))
@@ -211,6 +258,8 @@ def train_one_run(
     lr: float,
     momentum: float,
     weight_decay: float,
+    backend: str = "manual",
+    agg_kwargs: Dict = None,
     show_bar: bool = False,
 ) -> Tuple[List[float], List[float], Dict[str, int]]:
     model.train()
@@ -230,6 +279,20 @@ def train_one_run(
         "sanitized_agg_batches": 0,
     }
 
+    backend = str(backend).lower()
+    engine = None
+    upgrad_weighting = None
+    agg_kwargs = agg_kwargs or {}
+    if backend == "autogram":
+        if TJEngine is None or tjagg is None:
+            raise ImportError("torchjd is required for autogram backend.")
+        engine = TJEngine(model, batch_dim=0)
+        upgrad_weighting = getattr(tjagg, "UPGradWeighting", None)
+        if upgrad_weighting is None:
+            raise ValueError("torchjd.aggregation.UPGradWeighting is unavailable.")
+        epsilon = float(agg_kwargs.get("epsilon", 1e-8))
+        upgrad_weighting = upgrad_weighting(epsilon=epsilon)
+
     for _ in range(num_epochs):
         for x, y in tqdm(loader, desc="Train", leave=False, disable=bar_disable):
             stats["total_batches"] += 1
@@ -244,28 +307,71 @@ def train_one_run(
                 stats["skipped_nonfinite_loss_batches"] += 1
                 continue
 
-            jac_rows = []
-            for i in range(per_sample_losses.shape[0]):
+            if backend == "manual":
+                jac_rows = []
+                for i in range(per_sample_losses.shape[0]):
+                    optimizer.zero_grad(set_to_none=True)
+                    per_sample_losses[i].backward(
+                        retain_graph=(i + 1 < per_sample_losses.shape[0])
+                    )
+                    jac_rows.append(flatten_grads(params))
+
+                J = torch.stack(jac_rows, dim=0)  # [m, n]
+                if not torch.isfinite(J).all():
+                    J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
+                    stats["sanitized_j_batches"] += 1
+                agg = aggregator([row for row in J])
+                if not torch.isfinite(agg).all():
+                    agg = torch.nan_to_num(agg, nan=0.0, posinf=0.0, neginf=0.0)
+                    stats["sanitized_agg_batches"] += 1
+                mean_grad = J.mean(dim=0)
+                sim = torch.nn.functional.cosine_similarity(
+                    agg.unsqueeze(0), mean_grad.unsqueeze(0), dim=1, eps=1e-12
+                ).item()
+
                 optimizer.zero_grad(set_to_none=True)
-                per_sample_losses[i].backward(retain_graph=(i + 1 < per_sample_losses.shape[0]))
-                jac_rows.append(flatten_grads(params))
+                assign_flat_grad(params, agg)
+                optimizer.step()
+            else:
+                # Compute mean gradient for cosine similarity
+                optimizer.zero_grad(set_to_none=True)
+                per_sample_losses.mean().backward(retain_graph=True)
+                mean_grad = flatten_grads(params)
 
-            J = torch.stack(jac_rows, dim=0)  # [m, n]
-            if not torch.isfinite(J).all():
-                J = torch.nan_to_num(J, nan=0.0, posinf=0.0, neginf=0.0)
-                stats["sanitized_j_batches"] += 1
-            agg = aggregator([row for row in J])
-            if not torch.isfinite(agg).all():
-                agg = torch.nan_to_num(agg, nan=0.0, posinf=0.0, neginf=0.0)
-                stats["sanitized_agg_batches"] += 1
-            mean_grad = J.mean(dim=0)
-            sim = torch.nn.functional.cosine_similarity(
-                agg.unsqueeze(0), mean_grad.unsqueeze(0), dim=1, eps=1e-12
-            ).item()
+                optimizer.zero_grad(set_to_none=True)
+                if backend == "autogram":
+                    gramian = engine.compute_gramian(per_sample_losses)
+                    if not torch.isfinite(gramian).all():
+                        gramian = torch.nan_to_num(gramian, nan=0.0, posinf=0.0, neginf=0.0)
+                        stats["sanitized_j_batches"] += 1
+                    weights = upgrad_weighting(gramian)
+                    if not torch.isfinite(weights).all():
+                        weights = torch.ones_like(weights) / weights.numel()
+                        stats["sanitized_agg_batches"] += 1
+                    per_sample_losses.backward(weights)
+                else:
+                    if tj_backward is None:
+                        raise ImportError("torchjd is required for autojac backend.")
+                    try:
+                        tj_backward(per_sample_losses, aggregator)
+                    except Exception as e:
+                        # Fallback to mean gradient on failure.
+                        print(
+                            f"torchjd autojac failed ({type(e).__name__}): {e}. Using mean."
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        per_sample_losses.mean().backward()
 
-            optimizer.zero_grad(set_to_none=True)
-            assign_flat_grad(params, agg)
-            optimizer.step()
+                agg_grad = flatten_grads(params)
+                if not torch.isfinite(agg_grad).all():
+                    agg_grad = torch.nan_to_num(agg_grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    stats["sanitized_agg_batches"] += 1
+
+                sim = torch.nn.functional.cosine_similarity(
+                    agg_grad.unsqueeze(0), mean_grad.unsqueeze(0), dim=1, eps=1e-12
+                ).item()
+                assign_flat_grad(params, agg_grad)
+                optimizer.step()
 
             loss_trace.append(per_sample_losses.mean().item())
             sim_trace.append(sim)
@@ -293,6 +399,7 @@ def select_lr(
     cfg: Dict,
     device: str,
     show_bar: bool,
+    backend: str,
 ) -> Tuple[float, List[Dict]]:
     search_cfg = cfg.get("learning_rate_search", {})
     enabled = bool(search_cfg.get("enabled", True))
@@ -309,7 +416,7 @@ def select_lr(
     def run_trial(lr: float) -> float:
         model = PaperCIFARNet().to(device)
         model.load_state_dict(base_model_state)
-        aggregator = get_aggregator(agg_type, **agg_kwargs)
+        aggregator = get_torchjd_aggregator(agg_type, **agg_kwargs) if backend != "manual" else get_aggregator(agg_type, **agg_kwargs)
         losses, _, _ = train_one_run(
             model=model,
             loader=loader,
@@ -319,6 +426,8 @@ def select_lr(
             lr=lr,
             momentum=float(cfg["training"]["momentum"]),
             weight_decay=float(cfg["training"]["weight_decay"]),
+            backend=backend,
+            agg_kwargs=agg_kwargs,
             show_bar=show_bar,
         )
         score = auc_of_loss(losses)
@@ -453,33 +562,58 @@ def main() -> None:
     momentum = float(cfg.get("training", {}).get("momentum", 0.0))
     weight_decay = float(cfg.get("training", {}).get("weight_decay", 0.0))
     augment = bool(cfg.get("dataset", {}).get("augment", False))
+    backend = str(cfg.get("training", {}).get("iwrm_backend", "manual")).lower()
 
     os.makedirs(data_root, exist_ok=True)
     output_dir = cfg.get("logging", {}).get("log_dir", "./logs_paper")
     os.makedirs(output_dir, exist_ok=True)
     show_progress = bool(cfg.get("logging", {}).get("show_progress", False))
     resume_enabled = bool(cfg.get("logging", {}).get("resume", True))
+    skip_completed = bool(cfg.get("logging", {}).get("skip_completed", True))
     partial_dir = os.path.join(output_dir, "partial")
     os.makedirs(partial_dir, exist_ok=True)
+    out_json = os.path.join(output_dir, "results.json")
 
     print(f"Using device: {device}")
     print(f"Seeds: {run_seeds}")
     print(f"Subset size: {subset_size}, batch size: {batch_size}, epochs: {num_epochs}")
 
-    all_results = {}
+    existing_results = load_existing_results(out_json) if resume_enabled else {}
+    completed_cache, lr_trials_cache = build_completed_cache(existing_results)
+    all_results = dict(existing_results)
 
     for agg_cfg in cfg.get("aggregators", []):
         agg_name = agg_cfg["name"]
         agg_type = agg_cfg["type"]
         agg_kwargs = {k: v for k, v in agg_cfg.items() if k not in ["name", "type"]}
+        effective_backend = backend
+        if backend == "autogram" and str(agg_type).lower() != "upgrad":
+            print(
+                f"[{agg_name}] autogram backend only supports UPGrad; "
+                f"falling back to autojac."
+            )
+            effective_backend = "autojac"
         print("\n" + "=" * 70)
         print(f"Aggregator: {agg_name}")
         print("=" * 70)
 
         traces: List[RunTrace] = []
-        lr_trials_per_seed: Dict[str, List[Dict]] = {}
+        lr_trials_per_seed: Dict[str, List[Dict]] = dict(lr_trials_cache.get(agg_name, {}))
+        completed_seeds = set()
+
+        if resume_enabled:
+            for seed, trace in completed_cache.get(agg_name, {}).items():
+                traces.append(trace)
+                completed_seeds.add(int(seed))
+
+        if skip_completed and len(completed_seeds) == len(run_seeds):
+            print(f"[{agg_name}] already completed for all seeds, skipping.")
+            continue
 
         for seed in run_seeds:
+            if resume_enabled and int(seed) in completed_seeds:
+                print(f"[{agg_name}] seed={seed} already in results.json, skip recompute.")
+                continue
             partial_path = os.path.join(
                 partial_dir, f"{_safe_name(agg_name)}_seed{int(seed)}.json"
             )
@@ -516,12 +650,16 @@ def main() -> None:
                 cfg=cfg,
                 device=device,
                 show_bar=show_progress,
+                backend=effective_backend,
             )
             lr_trials_per_seed[str(seed)] = lr_trials
 
             model = PaperCIFARNet().to(device)
             model.load_state_dict(init_state)
-            aggregator = get_aggregator(agg_type, **agg_kwargs)
+            if effective_backend == "manual":
+                aggregator = get_aggregator(agg_type, **agg_kwargs)
+            else:
+                aggregator = get_torchjd_aggregator(agg_type, **agg_kwargs)
 
             loss_trace, sim_trace, health_stats = train_one_run(
                 model=model,
@@ -532,6 +670,8 @@ def main() -> None:
                 lr=best_lr,
                 momentum=momentum,
                 weight_decay=weight_decay,
+                backend=effective_backend,
+                agg_kwargs=agg_kwargs,
                 show_bar=show_progress,
             )
             traces.append(
@@ -566,10 +706,9 @@ def main() -> None:
         agg_result["lr_trials"] = lr_trials_per_seed
         all_results[agg_name] = agg_result
         # Persist merged results after each aggregator for safer long runs.
-        with open(os.path.join(output_dir, "results.json"), "w", encoding="utf-8") as f:
+        with open(out_json, "w", encoding="utf-8") as f:
             json.dump(all_results, f, indent=2)
 
-    out_json = os.path.join(output_dir, "results.json")
     out_png = os.path.join(output_dir, "results.png")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)

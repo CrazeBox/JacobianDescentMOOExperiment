@@ -371,3 +371,35 @@ def get_aggregator(name: str, **kwargs) -> Aggregator:
         )
 
     return aggregators[key](**kwargs)
+
+
+def get_torchjd_aggregator(name: str, **kwargs):
+    """
+    Factory for torchjd.aggregation classes (no Jacobian stacking wrapper).
+    """
+    if tjagg is None:
+        raise ImportError("torchjd is required for torchjd backend aggregators.")
+
+    normalized = name.lower().replace("-", "").replace("_", "")
+    mapping = {
+        "mean": "Mean",
+        "sum": "Sum",
+        "upgrad": "UPGrad",
+        "mgda": "MGDA",
+        "cagrad": "CAGrad",
+        "pcgrad": "PCGrad",
+        "dualproj": "DualProj",
+        "alignedmtl": "AlignedMTL",
+        "graddrop": "GradDrop",
+        "imtlg": "IMTLG",
+        "nashmtl": "NashMTL",
+        "rgw": "Random",
+        "random": "Random",
+    }
+    class_name = mapping.get(normalized)
+    if class_name is None:
+        raise ValueError(f"Unsupported torchjd aggregator type: {name}")
+    cls = getattr(tjagg, class_name, None)
+    if cls is None:
+        raise ValueError(f"torchjd.aggregation has no class '{class_name}'.")
+    return cls(**kwargs)

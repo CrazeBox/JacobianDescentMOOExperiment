@@ -71,6 +71,10 @@ This pipeline implements:
 - Reporting mean/SEM curves for:
   - training cross-entropy
   - update cosine similarity to SGD
+- Backend selector for IWRM:
+  - `training.iwrm_backend: "manual"` uses explicit per-sample Jacobian (slow, no torchjd needed)
+  - `training.iwrm_backend: "autojac"` uses `torchjd.autojac` (aligns with TorchJD official approach)
+  - `training.iwrm_backend: "autogram"` uses `torchjd.autogram` (UPGrad only; others fall back to autojac)
 - Resume support for long jobs:
   - set `logging.resume: true`
   - completed `(aggregator, seed)` runs are saved under `<log_dir>/partial/`
