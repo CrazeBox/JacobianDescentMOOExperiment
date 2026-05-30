@@ -1,2 +1,3 @@
 # JacobianDescentMOOExperiment
-复现JacobianDescent代码
+Re the code of Jacobian Descent
+paper is ：arxiv:2406.16232
